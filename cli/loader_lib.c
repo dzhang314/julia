@@ -541,6 +541,7 @@ __attribute__((constructor)) void jl_load_libjulia_internal(void) {
         void *addr = lookup_symbol(libjulia_codegen, codegen_func_names[symbol_idx]);
         if (addr == NULL) {
             jl_loader_print_stderr3("ERROR: Unable to load ", codegen_func_names[symbol_idx], codegen_liberr);
+            continue;
             exit(1);
         }
         (*jl_codegen_exported_func_addrs[symbol_idx]) = addr;

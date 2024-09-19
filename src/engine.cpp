@@ -152,6 +152,10 @@ void jl_engine_fulfill(jl_code_instance_t *ci, jl_code_info_t *src)
     engine_wait.notify_all();
 }
 
+void jl_engine_codegen(jl_code_instance_t *ci, jl_code_info_t *src)
+{
+    // _jl_compile_codeinst(TSC, ci, src)
+}
 
 #ifdef __cplusplus
 }

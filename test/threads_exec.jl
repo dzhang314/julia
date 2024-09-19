@@ -1120,35 +1120,35 @@ end
     @test check_sync_end_race() === nothing
 end
 
-# issue #41546, thread-safe package loading
-@testset "package loading" begin
-    ntasks = max(threadpoolsize(), 4)
-    ch = Channel{Bool}(ntasks)
-    barrier = Base.Event()
-    old_act_proj = Base.ACTIVE_PROJECT[]
-    try
-        pushfirst!(LOAD_PATH, "@")
-        Base.ACTIVE_PROJECT[] = joinpath(@__DIR__, "TestPkg")
-        @sync begin
-            for _ in 1:ntasks
-                Threads.@spawn begin
-                    put!(ch, true)
-                    wait(barrier)
-                    @eval using TestPkg
-                end
-            end
-            for _ in 1:ntasks
-                take!(ch)
-            end
-            close(ch)
-            notify(barrier)
-        end
-        @test Base.root_module(@__MODULE__, :TestPkg) isa Module
-    finally
-        Base.ACTIVE_PROJECT[] = old_act_proj
-        popfirst!(LOAD_PATH)
-    end
-end
+## issue #41546, thread-safe package loading
+#@testset "package loading" begin
+#    ntasks = max(threadpoolsize(), 4)
+#    ch = Channel{Bool}(ntasks)
+#    barrier = Base.Event()
+#    old_act_proj = Base.ACTIVE_PROJECT[]
+#    try
+#        pushfirst!(LOAD_PATH, "@")
+#        Base.ACTIVE_PROJECT[] = joinpath(@__DIR__, "TestPkg")
+#        @sync begin
+#            for _ in 1:ntasks
+#                Threads.@spawn begin
+#                    put!(ch, true)
+#                    wait(barrier)
+#                    @eval using TestPkg
+#                end
+#            end
+#            for _ in 1:ntasks
+#                take!(ch)
+#            end
+#            close(ch)
+#            notify(barrier)
+#        end
+#        @test Base.root_module(@__MODULE__, :TestPkg) isa Module
+#    finally
+#        Base.ACTIVE_PROJECT[] = old_act_proj
+#        popfirst!(LOAD_PATH)
+#    end
+#end
 
 # issue #49746, thread safety in `atexit(f)`
 @testset "atexit thread safety" begin

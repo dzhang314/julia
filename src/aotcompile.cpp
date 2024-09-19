@@ -1974,11 +1974,6 @@ void jl_dump_native_impl(void *native_code,
     }
 }
 
-void addTargetPasses(legacy::PassManagerBase *PM, const Triple &triple, TargetIRAnalysis analysis)
-{
-    PM->add(new TargetLibraryInfoWrapperPass(triple));
-    PM->add(createTargetTransformInfoWrapperPass(std::move(analysis)));
-}
 
 // sometimes in GDB you want to find out what code would be created from a mi
 extern "C" JL_DLLEXPORT_CODEGEN jl_code_info_t *jl_gdbdumpcode(jl_method_instance_t *mi)
