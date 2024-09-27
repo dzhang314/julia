@@ -81,7 +81,7 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(f),
             splitsigs = switchtupleunion(sig)
             for sig_n in splitsigs
                 result = abstract_call_method(interp, method, sig_n, svec(), multiple_matches, si, sv)
-                (; rt, exct, edge, effects, volatile_inf_result) = result
+                (; rt, exct, effects, volatile_inf_result) = result
                 this_argtypes = isa(matches, MethodMatches) ? argtypes : matches.applicable_argtypes[i]
                 this_arginfo = ArgInfo(fargs, this_argtypes)
                 const_call_result = abstract_call_method_with_const_args(interp,
@@ -90,14 +90,14 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(f),
                 if const_call_result !== nothing
                     if const_call_result.rt ⊑ₚ rt
                         rt = const_call_result.rt
-                        (; effects, const_result, edge) = const_call_result
+                        (; effects, const_result) = const_call_result
                     elseif is_better_effects(const_call_result.effects, effects)
-                        (; effects, const_result, edge) = const_call_result
+                        (; effects, const_result) = const_call_result
                     else
                         add_remark!(interp, sv, "[constprop] Discarded because the result was wider than inference")
                     end
                     if const_call_result.exct ⋤ exct
-                        (; exct, const_result, edge) = const_call_result
+                        (; exct, const_result) = const_call_result
                     else
                         add_remark!(interp, sv, "[constprop] Discarded exception type because result was wider than inference")
                     end
@@ -119,7 +119,7 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(f),
             this_rt = widenwrappedconditional(this_rt)
         else
             result = abstract_call_method(interp, method, sig, match.sparams, multiple_matches, si, sv)
-            (; rt, exct, edge, effects, volatile_inf_result) = result
+            (; rt, exct, effects, volatile_inf_result) = result
             this_conditional = ignorelimited(rt)
             this_rt = widenwrappedconditional(rt)
             this_exct = exct
@@ -143,9 +143,9 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(f),
                     # e.g. in cases when there are cycles but cached result is still accurate
                     this_conditional = this_const_conditional
                     this_rt = this_const_rt
-                    (; effects, const_result, edge) = const_call_result
+                    (; effects, const_result) = const_call_result
                 elseif is_better_effects(const_call_result.effects, effects)
-                    (; effects, const_result, edge) = const_call_result
+                    (; effects, const_result) = const_call_result
                 else
                     add_remark!(interp, sv, "[constprop] Discarded because the result was wider than inference")
                 end
@@ -153,7 +153,7 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(f),
                 # because consistent-cy does not apply to exceptions.
                 if const_call_result.exct ⋤ this_exct
                     this_exct = const_call_result.exct
-                    (; const_result, edge) = const_call_result
+                    (; const_result) = const_call_result
                 else
                     add_remark!(interp, sv, "[constprop] Discarded exception type because result was wider than inference")
                 end
@@ -849,13 +849,11 @@ struct ConstCallResults
     exct::Any
     const_result::ConstResult
     effects::Effects
-    edge::MethodInstance
     function ConstCallResults(
         @nospecialize(rt), @nospecialize(exct),
         const_result::ConstResult,
-        effects::Effects,
-        edge::MethodInstance)
-        return new(rt, exct, const_result, effects, edge)
+        effects::Effects)
+        return new(rt, exct, const_result, effects)
     end
 end
 
@@ -1007,9 +1005,9 @@ function concrete_eval_call(interp::AbstractInterpreter,
     catch e
         # The evaluation threw. By :consistent-cy, we're guaranteed this would have happened at runtime.
         # Howevever, at present, :consistency does not mandate the type of the exception
-        return ConstCallResults(Bottom, Any, ConcreteResult(edge, result.effects), result.effects, edge)
+        return ConstCallResults(Bottom, Any, ConcreteResult(edge, result.effects), result.effects)
     end
-    return ConstCallResults(Const(value), Union{}, ConcreteResult(edge, EFFECTS_TOTAL, value), EFFECTS_TOTAL, edge)
+    return ConstCallResults(Const(value), Union{}, ConcreteResult(edge, EFFECTS_TOTAL, value), EFFECTS_TOTAL)
 end
 
 # check if there is a cycle and duplicated inference of `mi`
@@ -1274,7 +1272,7 @@ function semi_concrete_eval_call(interp::AbstractInterpreter,
                     effects = Effects(effects; noub=ALWAYS_TRUE)
                 end
                 exct = refine_exception_type(result.exct, effects)
-                return ConstCallResults(rt, exct, SemiConcreteResult(mi, ir, effects), effects, mi)
+                return ConstCallResults(rt, exct, SemiConcreteResult(mi, ir, effects), effects)
             end
         end
     end
@@ -1283,7 +1281,7 @@ end
 
 const_prop_result(inf_result::InferenceResult) =
     ConstCallResults(inf_result.result, inf_result.exc_result, ConstPropResult(inf_result),
-                     inf_result.ipo_effects, inf_result.linfo)
+                     inf_result.ipo_effects)
 
 # return cached result of constant analysis
 return_cached_result(::AbstractInterpreter, inf_result::InferenceResult, ::AbsIntState) =
@@ -2114,7 +2112,7 @@ function abstract_invoke(interp::AbstractInterpreter, arginfo::ArgInfo, si::Stmt
     tienv = ccall(:jl_type_intersection_with_env, Any, (Any, Any), nargtype, method.sig)::SimpleVector
     ti = tienv[1]; env = tienv[2]::SimpleVector
     result = abstract_call_method(interp, method, ti, env, false, si, sv)
-    (; rt, exct, edge, effects, volatile_inf_result) = result
+    (; rt, exct, effects, volatile_inf_result) = result
     match = MethodMatch(ti, env, method, argtype <: method.sig)
     res = nothing
     sig = match.spec_types
@@ -2136,10 +2134,10 @@ function abstract_invoke(interp::AbstractInterpreter, arginfo::ArgInfo, si::Stmt
     const_result = volatile_inf_result
     if const_call_result !== nothing
         if const_call_result.rt ⊑ rt
-            (; rt, effects, const_result, edge) = const_call_result
+            (; rt, effects, const_result) = const_call_result
         end
         if const_call_result.exct ⋤ exct
-            (; exct, const_result, edge) = const_call_result
+            (; exct, const_result) = const_call_result
         end
     end
     rt = from_interprocedural!(interp, rt, sv, arginfo, sig)
@@ -2323,20 +2321,20 @@ function abstract_call_opaque_closure(interp::AbstractInterpreter,
     hasintersect(sig, ocsig) || return CallMeta(Union{}, Union{MethodError,TypeError}, EFFECTS_THROWS, NoCallInfo())
     ocmethod = closure.source::Method
     result = abstract_call_method(interp, ocmethod, sig, Core.svec(), false, si, sv)
-    (; rt, exct, edge, effects, volatile_inf_result) = result
+    (; rt, exct, effects, volatile_inf_result) = result
     match = MethodMatch(sig, Core.svec(), ocmethod, sig <: ocsig)
     𝕃ₚ = ipo_lattice(interp)
     ⊑, ⋤, ⊔ = partialorder(𝕃ₚ), strictneqpartialorder(𝕃ₚ), join(𝕃ₚ)
     const_result = volatile_inf_result
     if !result.edgecycle
         const_call_result = abstract_call_method_with_const_args(interp, result,
-            nothing, arginfo, si, match, sv)
+            #=f=#nothing, arginfo, si, match, sv)
         if const_call_result !== nothing
             if const_call_result.rt ⊑ rt
-                (; rt, effects, const_result, edge) = const_call_result
+                (; rt, effects, const_result) = const_call_result
             end
             if const_call_result.exct ⋤ exct
-                (; exct, const_result, edge) = const_call_result
+                (; exct, const_result) = const_call_result
             end
         end
     end
