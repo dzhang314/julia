@@ -267,30 +267,32 @@ static int jl_analyze_workqueue(jl_code_instance_t *callee, jl_codegen_params_t 
         jl_code_instance_t *codeinst = it.first;
         auto proto = it.second;
         // try to emit code for this item from the workqueue
+        StringRef invokeName = "";
         StringRef preal_decl = "";
         bool preal_specsig = false;
         jl_callptr_t invoke = nullptr;
         bool isedge = false;
-        if (params.cache) {
-            // WARNING: this correctness is protected by an outer lock
-            uint8_t specsigflags;
-            void *fptr;
-            jl_read_codeinst_invoke(codeinst, &specsigflags, &invoke, &fptr, 0);
-            //if (specsig ? specsigflags & 0b1 : invoke == jl_fptr_args_addr)
-            if (invoke == jl_fptr_args_addr) {
-                preal_decl = jl_ExecutionEngine->getFunctionAtAddress((uintptr_t)fptr, invoke, codeinst);
-            }
-            else if (specsigflags & 0b1) {
-                preal_decl = jl_ExecutionEngine->getFunctionAtAddress((uintptr_t)fptr, invoke, codeinst);
-                preal_specsig = true;
-            }
-            if (invoke != nullptr)
-                force = true;
+        assert(params.cache);
+        // Checking the cache here is merely an optimization and not strictly required
+        // But it must be consistent with the following invokenames lookup, which is protected by the engine_lock
+        uint8_t specsigflags;
+        void *fptr;
+        jl_read_codeinst_invoke(codeinst, &specsigflags, &invoke, &fptr, 0);
+        //if (specsig ? specsigflags & 0b1 : invoke == jl_fptr_args_addr)
+        if (invoke == jl_fptr_args_addr) {
+            preal_decl = jl_ExecutionEngine->getFunctionAtAddress((uintptr_t)fptr, invoke, codeinst);
         }
+        else if (specsigflags & 0b1) {
+            preal_decl = jl_ExecutionEngine->getFunctionAtAddress((uintptr_t)fptr, invoke, codeinst);
+            preal_specsig = true;
+        }
+        if (invoke != nullptr)
+            force = true;
         if (preal_decl.empty()) {
             auto it = invokenames.find(codeinst);
             if (it != invokenames.end()) {
                 auto &decls = it->second;
+                invokeName = decls.functionObject;
                 if (decls.functionObject == "jl_fptr_args") {
                     preal_decl = decls.specFunctionObject;
                     isedge = true;
@@ -309,9 +311,16 @@ static int jl_analyze_workqueue(jl_code_instance_t *callee, jl_codegen_params_t 
             assert(proto.decl->isDeclaration());
             if (proto.specsig != preal_specsig || preal_decl.empty()) {
                 isedge = false;
-                StringRef invokeName;
-                if (invoke != nullptr)
-                    invokeName = jl_ExecutionEngine->getFunctionAtAddress((uintptr_t)invoke, invoke, codeinst);
+                if (invoke != nullptr && invokeName.empty()) {
+                    if (invoke == jl_fptr_args_addr)
+                        invokeName = "jl_fptr_args";
+                    else if (invoke == jl_fptr_sparam_addr)
+                        invokeName = "jl_fptr_sparam";
+                    else if (invoke == jl_f_opaque_closure_call_addr)
+                        invokeName = "jl_f_opaque_closure_call";
+                    else
+                        invokeName = jl_ExecutionEngine->getFunctionAtAddress((uintptr_t)invoke, invoke, codeinst);
+                }
                 Function *preal = emit_tojlinvoke(codeinst, invokeName, mod, params);
                 if (proto.specsig) {
                     // emit specsig-to-(jl)invoke conversion
@@ -440,16 +449,31 @@ static void jl_compile_codeinst_now(jl_code_instance_t *codeinst) JL_NOTSAFEPOIN
     while (!compileready.empty()) {
         // move a function from compileready to linkready then compile it
         auto compilenext = compileready.begin();
-        auto TSMref = emittedmodules.find(*compilenext);
+        codeinst = *compilenext;
+        compileready.erase(compilenext);
+        auto TSMref = emittedmodules.find(codeinst);
         assert(TSMref != emittedmodules.end());
         auto TSM = std::move(TSMref->second);
-        linkready.insert(*compilenext);
-        compileready.erase(compilenext);
+        linkready.insert(codeinst);
         emittedmodules.erase(TSMref);
         lock.unlock();
+        uint64_t start_time = jl_hrtime();
         jl_ExecutionEngine->addModule(std::move(TSM));
+        // If logging of the compilation stream is enabled,
+        // then dump the method-instance specialization type to the stream
+        jl_method_instance_t *mi = codeinst->def;
+        if (jl_is_method(mi->def.method)) {
+            auto stream = *jl_ExecutionEngine->get_dump_compiles_stream();
+            if (stream) {
+                uint64_t end_time = jl_hrtime();
+                ios_printf(stream, "%" PRIu64 "\t\"", end_time - start_time);
+                jl_static_show((JL_STREAM*)stream, mi->specTypes);
+                ios_printf(stream, "\"\n");
+            }
+        }
         lock.lock();
     }
+    codeinst = nullptr;
     // barrier until all threads have finished calling addModule
     if (--threads_in_compiler_phase == 0) {
         // the last thread out will finish linking everything

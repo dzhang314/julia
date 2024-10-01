@@ -5570,9 +5570,9 @@ static jl_cgval_t emit_invoke(jl_codectx_t &ctx, const jl_cgval_t &lival, ArrayR
     if (!handled) {
         if (trim_may_error(ctx.params->trim)) {
             if (lival.constant) {
-                arraylist_push(&new_invokes, lival.constant);
                 push_frames(ctx, ctx.linfo, (jl_method_instance_t*)lival.constant);
-            } else {
+            }
+            else {
                 errs() << "Dynamic call to unknown function";
                 errs() << "In " << ctx.builder.getCurrentDebugLocation()->getFilename() << ":" << ctx.builder.getCurrentDebugLocation()->getLine() << "\n";
 
@@ -5762,48 +5762,7 @@ static jl_cgval_t emit_call(jl_codectx_t &ctx, jl_expr_t *ex, jl_value_t *rt, bo
     }
     int failed_dispatch = !argv[0].constant;
     if (ctx.params->trim != JL_TRIM_NO) {
-        size_t min_valid = 1;
-        size_t max_valid = ~(size_t)0;
-        size_t latest_world = jl_get_world_counter(); // TODO: marshal the world age of the compilation here.
-
-        // Find all methods matching the call signature
-        jl_array_t *matches = NULL;
-        jl_value_t *tup = NULL;
-        JL_GC_PUSH2(&tup, &matches);
-        if (!failed_dispatch) {
-            SmallVector<jl_value_t*> argtypes;
-            for (auto& arg: argv)
-                argtypes.push_back(arg.typ);
-            tup = jl_apply_tuple_type_v(argtypes.data(), argtypes.size());
-            matches = (jl_array_t*)jl_matching_methods((jl_tupletype_t*)tup, jl_nothing, 10 /*TODO: make global*/, 1,
-                                                latest_world, &min_valid, &max_valid, NULL);
-            if ((jl_value_t*)matches == jl_nothing)
-                failed_dispatch = 1;
-        }
-
-        // Expand each matching method to its unique specialization, if it has exactly one
-        if (!failed_dispatch) {
-            size_t k;
-            size_t len = new_invokes.len;
-            for (k = 0; k < jl_array_nrows(matches); k++) {
-                jl_method_match_t *match = (jl_method_match_t *)jl_array_ptr_ref(matches, k);
-                jl_method_instance_t *mi = jl_method_match_to_mi(match, latest_world, min_valid, max_valid, 0);
-                if (!mi) {
-                    if (jl_array_nrows(matches) == 1) {
-                        // if the method match is not compileable, but there is only one, fall back to
-                        // unspecialized implementation
-                        mi = jl_get_unspecialized(match->method);
-                    }
-                    else {
-                        new_invokes.len = len;
-                        failed_dispatch = 1;
-                        break;
-                    }
-                }
-                arraylist_push(&new_invokes, mi);
-            }
-        }
-        JL_GC_POP();
+        abort(); // this code path is unsound, unsafe, and bad
     }
 
     if (failed_dispatch && trim_may_error(ctx.params->trim)) {
@@ -6610,7 +6569,7 @@ static void emit_stmtpos(jl_codectx_t &ctx, jl_value_t *expr, int ssaval_result)
 
 static std::pair<Function*, Function*> get_oc_function(jl_codectx_t &ctx, jl_method_t *closure_method, jl_tupletype_t *env_t, jl_tupletype_t *argt_typ, jl_value_t *rettype)
 {
-    abort(); // this implementation violates the no-recursion rule we have for codegen
+    return {nullptr, nullptr}; // this implementation violates the no-recursion rule we have for codegen
     //jl_svec_t *sig_args = NULL;
     //jl_value_t *sigtype = NULL;
     //JL_GC_PUSH2(&sig_args, &sigtype);
@@ -7185,7 +7144,6 @@ Function *emit_tojlinvoke(jl_code_instance_t *codeinst, StringRef theFptrName, M
             name, M);
     jl_init_function(f, params.TargetTriple);
     if (trim_may_error(params.params->trim)) {
-        arraylist_push(&new_invokes, codeinst->def); // Try t compile this invoke
         // TODO: Debuginfo!
         push_frames(ctx, ctx.linfo, codeinst->def, 1);
     }
