@@ -115,6 +115,7 @@ CC.OptimizationParams(interp::EscapeAnalyzer) = interp.opt_params
 CC.get_inference_world(interp::EscapeAnalyzer) = interp.world
 CC.get_inference_cache(interp::EscapeAnalyzer) = interp.inf_cache
 CC.cache_owner(::EscapeAnalyzer) = EAToken()
+CC.get_escape_cache(interp::EscapeAnalyzer) = GetEscapeCache(interp)
 
 function CC.ipo_dataflow_analysis!(interp::EscapeAnalyzer, ir::IRCode, caller::InferenceResult)
     # run EA on all frames that have been optimized

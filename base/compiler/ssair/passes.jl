@@ -1300,7 +1300,13 @@ function sroa_pass!(ir::IRCode, inlining::Union{Nothing,InliningState}=nothing)
                 # Inlining performs legality checks on the finalizer to determine
                 # whether or not we may inline it. If so, it appends extra arguments
                 # at the end of the intrinsic. Detect that here.
-                length(stmt.args) == 5 || continue
+                if length(stmt.args) == 4 && stmt.args[4] === nothing
+                    # constant case
+                elseif length(stmt.args) == 5 && stmt.args[4] isa Bool && stmt.args[5] isa MethodInstance
+                    # inlining case
+                else
+                    continue
+                end
             end
             is_finalizer = true
         elseif isexpr(stmt, :foreigncall)
@@ -1685,7 +1691,32 @@ end
 function sroa_mutables!(ir::IRCode, defuses::IdDict{Int,Tuple{SPCSet,SSADefUse}}, used_ssas::Vector{Int}, lazydomtree::LazyDomtree, inlining::Union{Nothing,InliningState})
     𝕃ₒ = inlining === nothing ? SimpleInferenceLattice.instance : optimizer_lattice(inlining.interp)
     lazypostdomtree = LazyPostDomtree(ir)
+    function find_finalizer_idx(defuse::SSADefUse)
+        finalizer_idx = nothing
+        for use in defuse.uses
+            if use.kind === :finalizer
+                # For now: Only allow one finalizer per allocation
+                finalizer_idx !== nothing && return false
+                finalizer_idx = use.idx
+            end
+        end
+        if finalizer_idx === nothing
+            return true
+        elseif inlining === nothing
+            return false
+        end
+        return finalizer_idx
+    end
     for (defidx, (intermediaries, defuse)) in defuses
+        # Find the type for this allocation
+        defexpr = ir[SSAValue(defidx)][:stmt]
+        isexpr(defexpr, :new) || continue
+        typ = unwrap_unionall(ir.stmts[defidx][:type])
+        # Could still end up here if we tried to setfield! on an immutable, which would
+        # error at runtime, but is not illegal to have in the IR.
+        typ = widenconst(typ)
+        ismutabletype(typ) || continue
+        typ = typ::DataType
         # Check if there are any uses we did not account for. If so, the variable
         # escapes and we cannot eliminate the allocation. This works, because we're guaranteed
         # not to include any intermediaries that have dead uses. As a result, missing uses will only ever
@@ -1696,29 +1727,33 @@ function sroa_mutables!(ir::IRCode, defuses::IdDict{Int,Tuple{SPCSet,SSADefUse}}
             nuses += used_ssas[iidx]
         end
         nuses_total = used_ssas[defidx] + nuses - length(intermediaries)
-        nleaves == nuses_total || continue
-        # Find the type for this allocation
-        defexpr = ir[SSAValue(defidx)][:stmt]
-        isexpr(defexpr, :new) || continue
-        typ = unwrap_unionall(ir.stmts[defidx][:type])
-        # Could still end up here if we tried to setfield! on an immutable, which would
-        # error at runtime, but is not illegal to have in the IR.
-        typ = widenconst(typ)
-        ismutabletype(typ) || continue
-        typ = typ::DataType
-        # First check for any finalizer calls
-        finalizer_idx = nothing
-        for use in defuse.uses
-            if use.kind === :finalizer
-                # For now: Only allow one finalizer per allocation
-                finalizer_idx !== nothing && @goto skip
-                finalizer_idx = use.idx
+        if nleaves ≠ nuses_total
+            finalizer_idx = find_finalizer_idx(defuse)
+            if finalizer_idx isa Int
+                nargs = length(ir.argtypes) # TODO
+                estate = EscapeAnalysis.analyze_escapes(ir, nargs, 𝕃ₒ, get_escape_cache(inlining.interp))
+                einfo = estate[SSAValue(defidx)]
+                if EscapeAnalysis.has_no_escape(einfo)
+                    already = BitSet(use.idx for use in defuse.uses)
+                    for idx = einfo.Liveness
+                        if idx ∉ already
+                            push!(defuse.uses, SSAUse(:EALiveness, idx))
+                        end
+                    end
+                    try_resolve_finalizer!(ir, defidx, finalizer_idx, defuse, inlining::InliningState,
+                        lazydomtree, lazypostdomtree, ir[SSAValue(finalizer_idx)][:info])
+                end
             end
-        end
-        if finalizer_idx !== nothing && inlining !== nothing
-            try_resolve_finalizer!(ir, defidx, finalizer_idx, defuse, inlining,
-                lazydomtree, lazypostdomtree, ir[SSAValue(finalizer_idx)][:info])
             continue
+        else
+            finalizer_idx = find_finalizer_idx(defuse)
+            if finalizer_idx isa Int
+                try_resolve_finalizer!(ir, defidx, finalizer_idx, defuse, inlining::InliningState,
+                    lazydomtree, lazypostdomtree, ir[SSAValue(finalizer_idx)][:info])
+                continue
+            elseif !finalizer_idx
+                continue
+            end
         end
         # Partition defuses by field
         fielddefuse = SSADefUse[SSADefUse() for _ = 1:fieldcount(typ)]
