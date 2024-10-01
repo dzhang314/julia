@@ -125,11 +125,11 @@ struct jl_locked_stream {
         std::unique_lock<std::mutex> lck;
         ios_t *&stream;
 
-        lock(std::mutex &mutex, ios_t *&stream) JL_NOTSAFEPOINT
+        lock(std::mutex &mutex, ios_t *&stream) JL_NOTSAFEPOINT JL_NOTSAFEPOINT_ENTER
             : lck(mutex), stream(stream) {}
         lock(lock&) = delete;
         lock(lock&&) JL_NOTSAFEPOINT = default;
-        ~lock() JL_NOTSAFEPOINT = default;
+        ~lock() JL_NOTSAFEPOINT_LEAVE JL_NOTSAFEPOINT = default;
 
         ios_t *&operator*() JL_NOTSAFEPOINT {
             return stream;
@@ -148,8 +148,8 @@ struct jl_locked_stream {
         }
     };
 
-    jl_locked_stream() JL_NOTSAFEPOINT = default;
-    ~jl_locked_stream() JL_NOTSAFEPOINT = default;
+    jl_locked_stream() JL_NOTSAFEPOINT JL_NOTSAFEPOINT_ENTER = default;
+    ~jl_locked_stream() JL_NOTSAFEPOINT JL_NOTSAFEPOINT_LEAVE = default;
 
     lock operator*() JL_NOTSAFEPOINT {
         return lock(mutex, stream);
@@ -340,8 +340,8 @@ class JuliaOJIT {
 private:
     // any verification the user wants to do when adding an OwningResource to the pool
     template <typename AnyT>
-    static void verifyResource(AnyT &resource) { };
-    static void verifyResource(orc::ThreadSafeContext &context) { assert(context.getContext()); };
+    static void verifyResource(AnyT &resource) JL_NOTSAFEPOINT { }
+    static void verifyResource(orc::ThreadSafeContext &context) JL_NOTSAFEPOINT { assert(context.getContext()); }
 public:
     typedef orc::ObjectLinkingLayer ObjLayerT;
     typedef orc::IRCompileLayer CompileLayerT;
@@ -528,22 +528,21 @@ public:
     void addBytes(size_t bytes) JL_NOTSAFEPOINT;
     void printTimers() JL_NOTSAFEPOINT;
 
-    jl_locked_stream &get_dump_emitted_mi_name_stream() JL_NOTSAFEPOINT {
+    jl_locked_stream &get_dump_emitted_mi_name_stream() JL_NOTSAFEPOINT JL_NOTSAFEPOINT_ENTER {
         return dump_emitted_mi_name_stream;
     }
-    jl_locked_stream &get_dump_compiles_stream() JL_NOTSAFEPOINT {
+    jl_locked_stream &get_dump_compiles_stream() JL_NOTSAFEPOINT JL_NOTSAFEPOINT_ENTER {
         return dump_compiles_stream;
     }
-    jl_locked_stream &get_dump_llvm_opt_stream() JL_NOTSAFEPOINT {
+    jl_locked_stream &get_dump_llvm_opt_stream() JL_NOTSAFEPOINT JL_NOTSAFEPOINT_ENTER {
         return dump_llvm_opt_stream;
     }
     std::string getMangledName(StringRef Name) JL_NOTSAFEPOINT;
     std::string getMangledName(const GlobalValue *GV) JL_NOTSAFEPOINT;
 
-    // Note that this is a safepoint due to jl_get_library_ and jl_dlsym calls
-    void optimizeDLSyms(Module &M);
-
-    jl_mutex_t jitlock;
+    // Note that this is a potential safepoint due to jl_get_library_ and jl_dlsym calls
+    // but may be called from inside safe-regions due to jit compilation locks
+    void optimizeDLSyms(Module &M) JL_NOTSAFEPOINT_LEAVE JL_NOTSAFEPOINT_ENTER;
 
 private:
 

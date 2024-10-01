@@ -103,6 +103,27 @@ JL_DLLEXPORT void jl_unlock_field(jl_mutex_t *v) JL_NOTSAFEPOINT;
 
 #ifdef __cplusplus
 }
+
+#include <mutex>
+#include <condition_variable>
+// simple C++ shim around a std::unique_lock + gc-safe region
+// since we nearly always want that combination together
+class jl_unique_gcsafe_lock {
+public:
+    int8_t gc_state;
+    std::unique_lock<std::mutex> native;
+    explicit jl_unique_gcsafe_lock(std::mutex &native) JL_NOTSAFEPOINT_ENTER
+        : gc_state(jl_gc_safe_enter(jl_current_task->ptls)),
+          native(native) {}
+    jl_unique_gcsafe_lock(jl_unique_gcsafe_lock &&native) = delete;
+    jl_unique_gcsafe_lock(jl_unique_gcsafe_lock &native) = delete;
+    ~jl_unique_gcsafe_lock() JL_NOTSAFEPOINT_LEAVE {
+        jl_gc_safe_leave(jl_current_task->ptls, gc_state);
+    }
+    void wait(std::condition_variable& cond) JL_NOTSAFEPOINT {
+        cond.wait(native);
+    }
+};
 #endif
 
 #endif

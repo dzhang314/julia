@@ -325,11 +325,12 @@ static void compile_workqueue(jl_codegen_params_t &params, CompilationPolicy pol
     decltype(params.workqueue) workqueue;
     std::swap(params.workqueue, workqueue);
     jl_code_info_t *src = NULL;
-    JL_GC_PUSH1(&src);
+    jl_code_instance_t *codeinst = NULL;
+    JL_GC_PUSH2(&src, &codeinst);
     assert(!params.cache);
     while (!workqueue.empty()) {
         auto it = workqueue.pop_back_val();
-        jl_code_instance_t *codeinst = it.first;
+        codeinst = it.first;
         auto proto = it.second;
         // try to emit code for this item from the workqueue
         StringRef invokeName = "";

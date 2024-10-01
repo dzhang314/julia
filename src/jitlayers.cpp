@@ -186,59 +186,15 @@ void jl_jit_globals(std::map<void *, GlobalVariable*> &globals) JL_NOTSAFEPOINT
     }
 }
 
-// used for image_codegen, where we keep all the gvs external
-// so we can't jit them directly into each module
-static orc::ThreadSafeModule jl_get_globals_module(orc::ThreadSafeContext &ctx, const DataLayout &DL, const Triple &T, std::map<void *, GlobalVariable*> &globals) JL_NOTSAFEPOINT
-{
-    auto lock = ctx.getLock();
-    auto GTSM = jl_create_ts_module("globals", ctx, DL, T);
-    auto GM = GTSM.getModuleUnlocked();
-    for (auto &global : globals) {
-        auto GV = global.second;
-        auto GV2 = new GlobalVariable(*GM, GV->getValueType(), GV->isConstant(), GlobalValue::ExternalLinkage, literal_static_pointer_val(global.first, GV->getValueType()), GV->getName(), nullptr, GV->getThreadLocalMode(), GV->getAddressSpace(), false);
-        GV2->copyAttributesFrom(GV);
-        GV2->setDSOLocal(true);
-        GV2->setAlignment(GV->getAlign());
-    }
-    return GTSM;
-}
-
-static void finish_params(orc::ThreadSafeModule &TSM, jl_codegen_params_t &params) JL_NOTSAFEPOINT
-{
-    // The underlying context object for TSM is still locked because params is not destroyed yet
-    if (params._shared_module) {
-        jl_ExecutionEngine->optimizeDLSyms(*params._shared_module);
-        jl_ExecutionEngine->addModule(orc::ThreadSafeModule(std::move(params._shared_module), params.tsctx));
-    }
-
-    // In imaging mode, we can't inline global variable initializers in order to preserve
-    // the fiction that we don't know what loads from the global will return. Thus, we
-    // need to emit a separate module for the globals before any functions are compiled,
-    // to ensure that the globals are defined when they are compiled.
-    if (params.imaging_mode) {
-        // Won't contain any PLT/dlsym calls, so no need to optimize those
-        jl_ExecutionEngine->addModule(jl_get_globals_module(params.tsctx, params.DL, params.TargetTriple, params.global_targets));
-    }
-    else {
-        StringMap<void*> NewGlobals;
-        for (auto &global : params.global_targets) {
-            NewGlobals[global.second->getName()] = global.first;
-        }
-        auto M = TSM.getModuleUnlocked();
-        for (auto &GV : M->globals()) {
-            auto InitValue = NewGlobals.find(GV.getName());
-            if (InitValue != NewGlobals.end()) {
-                jl_link_global(&GV, InitValue->second);
-            }
-        }
-    }
-}
-
+  // lock for places where only single threaded behavior is implemented, so we need GC support
+static jl_mutex_t jitlock;
+static std::mutex jitlock_safe;
   // locks and barriers for this state
 static std::mutex engine_lock;
 static std::condition_variable engine_wait;
 static int threads_in_compiler_phase;
   // the TSM for each codeinst
+static SmallVector<orc::ThreadSafeModule,0> sharedmodules;
 static DenseMap<jl_code_instance_t*, orc::ThreadSafeModule> emittedmodules;
   // the invoke and specsig function names in the JIT
 static DenseMap<jl_code_instance_t*, jl_llvm_functions_t> invokenames;
@@ -259,8 +215,43 @@ static DenseMap<jl_code_instance_t*, SmallVector<jl_code_instance_t*,0>> incompl
 
 //static DenseSet<jl_code_instance_t*, jl_string_t*> compressed;
 
-static int jl_analyze_workqueue(jl_code_instance_t *callee, jl_codegen_params_t &params, bool force=false) JL_NOTSAFEPOINT
+static void finish_params(Module *M, jl_codegen_params_t &params) JL_NOTSAFEPOINT
 {
+    if (params._shared_module) {
+        sharedmodules.push_back(orc::ThreadSafeModule(std::move(params._shared_module), params.tsctx));
+    }
+
+    // In imaging mode, we can't inline global variable initializers in order to preserve
+    // the fiction that we don't know what loads from the global will return. Thus, we
+    // need to emit a separate module for the globals before any functions are compiled,
+    // to ensure that the globals are defined when they are compiled.
+    if (params.imaging_mode) {
+        void **globalslots = new void*[params.global_targets.size()];
+        for (auto &global : params.global_targets) {
+            auto GV = global.second;
+            *globalslots = global.first;
+            jl_ExecutionEngine->addGlobalMapping(GV->getName(), (uintptr_t)globalslots);
+            globalslots++;
+        }
+    }
+    else {
+        StringMap<void*> NewGlobals;
+        for (auto &global : params.global_targets) {
+            NewGlobals[global.second->getName()] = global.first;
+        }
+        for (auto &GV : M->globals()) {
+            auto InitValue = NewGlobals.find(GV.getName());
+            if (InitValue != NewGlobals.end()) {
+                jl_link_global(&GV, InitValue->second);
+            }
+        }
+    }
+}
+
+
+static int jl_analyze_workqueue(jl_code_instance_t *callee, jl_codegen_params_t &params, bool force=false) JL_NOTSAFEPOINT_LEAVE JL_NOTSAFEPOINT_ENTER
+{
+    jl_task_t *ct = jl_current_task;
     decltype(params.workqueue) edges;
     std::swap(params.workqueue, edges);
     for (auto &it : edges) {
@@ -329,7 +320,9 @@ static int jl_analyze_workqueue(jl_code_instance_t *callee, jl_codegen_params_t 
                     jl_init_function(proto.decl, params.TargetTriple);
                     size_t nrealargs = jl_nparams(codeinst->def->specTypes); // number of actual arguments being passed
                     // TODO: maybe this can be cached in codeinst->specfptr?
+                    int8_t gc_state = jl_gc_unsafe_enter(ct->ptls);
                     emit_cfunc_invalidate(proto.decl, proto.cc, proto.return_roots, codeinst->def->specTypes, codeinst->rettype, false, nrealargs, params, preal, 0, 0);
+                    jl_gc_unsafe_leave(ct->ptls, gc_state);
                     continue; // no need to fixup the name
                 }
                 else {
@@ -358,7 +351,7 @@ static int jl_analyze_workqueue(jl_code_instance_t *callee, jl_codegen_params_t 
 }
 
 // test whether codeinst->invoke is usable already without further compilation needed
-static bool jl_is_compiled_codeinst(jl_code_instance_t *codeinst)
+static bool jl_is_compiled_codeinst(jl_code_instance_t *codeinst) JL_NOTSAFEPOINT
 {
     auto invoke = jl_atomic_load_relaxed(&codeinst->invoke);
     if (invoke == nullptr || invoke == jl_fptr_wait_for_compiled_addr)
@@ -368,7 +361,7 @@ static bool jl_is_compiled_codeinst(jl_code_instance_t *codeinst)
 
 // move codeinst (and deps) from incompletemodules to emitted modules
 // and populate compileready from complete_graph
-static void prepare_compile(jl_code_instance_t *codeinst) JL_NOTSAFEPOINT
+static void prepare_compile(jl_unique_gcsafe_lock &lock, jl_code_instance_t *codeinst) JL_NOTSAFEPOINT_LEAVE JL_NOTSAFEPOINT_ENTER
 {
     SmallVector<jl_code_instance_t*> workqueue;
     workqueue.push_back(codeinst);
@@ -384,7 +377,7 @@ static void prepare_compile(jl_code_instance_t *codeinst) JL_NOTSAFEPOINT
         if (it != incompletemodules.end()) {
             int waiting = 0;
             auto &edges = complete_graph[codeinst];
-            auto edges_end = std::remove_if(edges.begin(), edges.end(), [&waiting, codeinst] (jl_code_instance_t *edge) -> bool {
+            auto edges_end = std::remove_if(edges.begin(), edges.end(), [&waiting, codeinst] (jl_code_instance_t *edge) JL_NOTSAFEPOINT -> bool {
                 auto &redges = incomplete_rgraph[edge];
                 // waiting += std::erase(redges, codeinst);
                 auto redges_end = std::remove(redges.begin(), redges.end(), codeinst);
@@ -402,7 +395,8 @@ static void prepare_compile(jl_code_instance_t *codeinst) JL_NOTSAFEPOINT
             params.tsctx_lock = params.tsctx.getLock();
             waiting = jl_analyze_workqueue(codeinst, params, true);
             assert(!waiting); (void)waiting;
-            finish_params(emittedmodules[codeinst], params);
+            Module *M = emittedmodules[codeinst].getModuleUnlocked();
+            finish_params(M, params);
             incompletemodules.erase(it);
         }
         // and then indicate this should be compiled now
@@ -416,7 +410,7 @@ static void prepare_compile(jl_code_instance_t *codeinst) JL_NOTSAFEPOINT
 }
 
 // notify any other pending work that this edge now has code defined
-static void complete_emit(jl_code_instance_t *edge) JL_NOTSAFEPOINT
+static void complete_emit(jl_code_instance_t *edge) JL_NOTSAFEPOINT_LEAVE JL_NOTSAFEPOINT_ENTER
 {
     auto notify = incomplete_rgraph.find(edge);
     if (notify == incomplete_rgraph.end())
@@ -429,9 +423,12 @@ static void complete_emit(jl_code_instance_t *edge) JL_NOTSAFEPOINT
         if (--std::get<2>(it->second) == 0) {
             auto &params = std::get<1>(it->second);
             params.tsctx_lock = params.tsctx.getLock();
-            int waiting = jl_analyze_workqueue(it->first, params);
+            jl_code_instance_t *codeinst = it->first;
+            JL_GC_PROMISE_ROOTED(codeinst);
+            int waiting = jl_analyze_workqueue(codeinst, params);
             assert(!waiting); (void)waiting;
-            finish_params(emittedmodules[it->first], params);
+            Module *M = emittedmodules[codeinst].getModuleUnlocked();;
+            finish_params(M, params);
             incompletemodules.erase(it);
         }
     }
@@ -439,39 +436,53 @@ static void complete_emit(jl_code_instance_t *edge) JL_NOTSAFEPOINT
 
 
 // set the invoke field for codeinst (and all deps, and assist with other pending work from other threads) now
-static void jl_compile_codeinst_now(jl_code_instance_t *codeinst) JL_NOTSAFEPOINT
+static void jl_compile_codeinst_now(jl_code_instance_t *codeinst)
 {
-    std::unique_lock<std::mutex> lock(engine_lock);
+    jl_unique_gcsafe_lock lock(engine_lock);
     if (!invokenames.count(codeinst))
         return;
     threads_in_compiler_phase++;
-    prepare_compile(codeinst);
-    while (!compileready.empty()) {
-        // move a function from compileready to linkready then compile it
-        auto compilenext = compileready.begin();
-        codeinst = *compilenext;
-        compileready.erase(compilenext);
-        auto TSMref = emittedmodules.find(codeinst);
-        assert(TSMref != emittedmodules.end());
-        auto TSM = std::move(TSMref->second);
-        linkready.insert(codeinst);
-        emittedmodules.erase(TSMref);
-        lock.unlock();
-        uint64_t start_time = jl_hrtime();
-        jl_ExecutionEngine->addModule(std::move(TSM));
-        // If logging of the compilation stream is enabled,
-        // then dump the method-instance specialization type to the stream
-        jl_method_instance_t *mi = codeinst->def;
-        if (jl_is_method(mi->def.method)) {
-            auto stream = *jl_ExecutionEngine->get_dump_compiles_stream();
-            if (stream) {
-                uint64_t end_time = jl_hrtime();
-                ios_printf(stream, "%" PRIu64 "\t\"", end_time - start_time);
-                jl_static_show((JL_STREAM*)stream, mi->specTypes);
-                ios_printf(stream, "\"\n");
-            }
+    prepare_compile(lock, codeinst);
+    while (1) {
+        if (!sharedmodules.empty()) {
+            auto TSM = sharedmodules.pop_back_val();
+            lock.native.unlock();
+            TSM.withModuleDo([](Module &M) JL_NOTSAFEPOINT_LEAVE JL_NOTSAFEPOINT_ENTER {
+                jl_ExecutionEngine->optimizeDLSyms(M); // safepoint
+            });
+            jl_ExecutionEngine->addModule(std::move(TSM));
+            lock.native.lock();
         }
-        lock.lock();
+        else if (!compileready.empty()) {
+            // move a function from compileready to linkready then compile it
+            auto compilenext = compileready.begin();
+            codeinst = *compilenext;
+            compileready.erase(compilenext);
+            auto TSMref = emittedmodules.find(codeinst);
+            assert(TSMref != emittedmodules.end());
+            auto TSM = std::move(TSMref->second);
+            linkready.insert(codeinst);
+            emittedmodules.erase(TSMref);
+            lock.native.unlock();
+            uint64_t start_time = jl_hrtime();
+            jl_ExecutionEngine->addModule(std::move(TSM)); // safepoint
+            // If logging of the compilation stream is enabled,
+            // then dump the method-instance specialization type to the stream
+            jl_method_instance_t *mi = codeinst->def;
+            if (jl_is_method(mi->def.method)) {
+                auto stream = *jl_ExecutionEngine->get_dump_compiles_stream();
+                if (stream) {
+                    uint64_t end_time = jl_hrtime();
+                    ios_printf(stream, "%" PRIu64 "\t\"", end_time - start_time);
+                    jl_static_show((JL_STREAM*)stream, mi->specTypes);
+                    ios_printf(stream, "\"\n");
+                }
+            }
+            lock.native.lock();
+        }
+        else {
+            break;
+        }
     }
     codeinst = nullptr;
     // barrier until all threads have finished calling addModule
@@ -535,7 +546,7 @@ static void jl_compile_codeinst_now(jl_code_instance_t *codeinst) JL_NOTSAFEPOIN
         engine_wait.notify_all();
     }
     else while (threads_in_compiler_phase) {
-        engine_wait.wait(lock);
+        lock.wait(engine_wait);
     }
 }
 
@@ -545,7 +556,7 @@ static void jl_emit_codeinst_to_jit(
         TSMSharedContext &contextowner)
 {
     { // lock scope
-        std::unique_lock<std::mutex> lock(engine_lock);
+        jl_unique_gcsafe_lock lock(engine_lock);
         if (invokenames.count(codeinst) || jl_is_compiled_codeinst(codeinst))
             return;
     }
@@ -563,7 +574,7 @@ static void jl_emit_codeinst_to_jit(
     { // unlock
         auto release = std::move(params.tsctx_lock);
     }
-    std::unique_lock<std::mutex> lock(engine_lock);
+    jl_unique_gcsafe_lock lock(engine_lock);
     if (invokenames.count(codeinst) || jl_is_compiled_codeinst(codeinst))
         return; // destroy everything
     invokenames[codeinst] = std::move(decls);
@@ -575,7 +586,7 @@ static void jl_emit_codeinst_to_jit(
         incompletemodules.insert(std::pair(codeinst, std::tuple(contextowner, std::move(params), waiting)));
     }
     else {
-        finish_params(result_m, params);
+        finish_params(result_m.getModuleUnlocked(), params);
     }
     emittedmodules[codeinst] = std::move(result_m);
 }
@@ -595,7 +606,7 @@ static void recursive_compile_graph(
         if (Seen.insert(this_code).second) {
             if (this_code != codeinst)
                 jl_emit_codeinst_to_jit(this_code, nullptr, contextowner); // contains safepoints
-            std::unique_lock<std::mutex> lock(engine_lock);
+            jl_unique_gcsafe_lock lock(engine_lock);
             auto edges = complete_graph.find(this_code);
             if (edges != complete_graph.end()) {
                 workqueue.append(edges->second);
@@ -643,7 +654,7 @@ int jl_compile_extern_c_impl(LLVMOrcThreadSafeModuleRef llvmmod, void *p, void *
         backing = jl_create_ts_module("cextern", pparams ? pparams->tsctx : ctx,  pparams ? pparams->DL : jl_ExecutionEngine->getDataLayout(), pparams ? pparams->TargetTriple : jl_ExecutionEngine->getTargetTriple());
         into = &backing;
     }
-    auto target_info = into->withModuleDo([&](Module &M) {
+    auto target_info = into->withModuleDo([&](Module &M) JL_NOTSAFEPOINT {
         return std::make_pair(M.getDataLayout(), Triple(M.getTargetTriple()));
     });
     jl_codegen_params_t params(into->getContext(), std::move(target_info.first), std::move(target_info.second));
@@ -655,7 +666,7 @@ int jl_compile_extern_c_impl(LLVMOrcThreadSafeModuleRef llvmmod, void *p, void *
     const char *name = jl_generate_ccallable(wrap(into), sysimg, declrt, sigt, *pparams);
     bool success = true;
     if (!sysimg) {
-        JL_LOCK(&jl_ExecutionEngine->jitlock); // TODO: use a better lock
+        jl_unique_gcsafe_lock lock(jitlock_safe);
         if (jl_ExecutionEngine->getGlobalValueAddress(name)) {
             success = false;
         }
@@ -663,17 +674,16 @@ int jl_compile_extern_c_impl(LLVMOrcThreadSafeModuleRef llvmmod, void *p, void *
             jl_jit_globals(params.global_targets);
             assert(params.workqueue.empty());
             if (params._shared_module) {
-                jl_ExecutionEngine->optimizeDLSyms(*params._shared_module);
+                jl_ExecutionEngine->optimizeDLSyms(*params._shared_module); // safepoint
                 jl_ExecutionEngine->addModule(orc::ThreadSafeModule(std::move(params._shared_module), params.tsctx));
             }
         }
         if (success && llvmmod == NULL) {
             into->withModuleDo([&](Module &M) {
-                jl_ExecutionEngine->optimizeDLSyms(M);
+                jl_ExecutionEngine->optimizeDLSyms(M); // safepoint
             });
             jl_ExecutionEngine->addModule(std::move(*into));
         }
-        JL_UNLOCK(&jl_ExecutionEngine->jitlock); // Might GC
     }
     if (timed) {
         if (measure_compile_time_enabled) {
@@ -759,25 +769,26 @@ void jl_generate_fptr_for_unspecialized_impl(jl_code_instance_t *unspec)
     uint8_t measure_compile_time_enabled = jl_atomic_load_relaxed(&jl_measure_compile_time_enabled);
     if (measure_compile_time_enabled)
         compiler_start_time = jl_hrtime();
-    JL_LOCK(&jl_ExecutionEngine->jitlock); // TODO: use a better lock
-    if (jl_atomic_load_relaxed(&unspec->invoke) == NULL) {
-        jl_code_info_t *src = NULL;
-        JL_GC_PUSH1(&src);
-        jl_method_t *def = unspec->def->def.method;
-        if (jl_is_method(def)) {
-            src = (jl_code_info_t*)def->source;
-            if (src && (jl_value_t*)src != jl_nothing)
-                src = jl_uncompress_ir(def, NULL, (jl_value_t*)src);
-        }
-        else {
-            jl_method_instance_t *mi = unspec->def;
-            jl_code_instance_t *uninferred = jl_cached_uninferred(
-                jl_atomic_load_relaxed(&mi->cache), 1);
-            assert(uninferred);
-            src = (jl_code_info_t*)jl_atomic_load_relaxed(&uninferred->inferred);
-            assert(src);
-        }
-        if (src) {
+    jl_code_info_t *src = NULL;
+    JL_GC_PUSH1(&src);
+    jl_method_t *def = unspec->def->def.method;
+    if (jl_is_method(def)) {
+        src = (jl_code_info_t*)def->source;
+        if (src && (jl_value_t*)src != jl_nothing)
+            src = jl_uncompress_ir(def, NULL, (jl_value_t*)src);
+    }
+    else {
+        jl_method_instance_t *mi = unspec->def;
+        jl_code_instance_t *uninferred = jl_cached_uninferred(
+            jl_atomic_load_relaxed(&mi->cache), 1);
+        assert(uninferred);
+        src = (jl_code_info_t*)jl_atomic_load_relaxed(&uninferred->inferred);
+        assert(src);
+    }
+    if (src) {
+        // TODO: first prepare recursive_compile_graph(unspec, src) before taking this lock to avoid recursion?
+        JL_LOCK(&jitlock); // TODO: use a better lock
+        if (jl_atomic_load_relaxed(&unspec->invoke) == NULL) {
             assert(jl_is_code_info(src));
             ++UnspecFPtrCount;
             jl_debuginfo_t *debuginfo = src->debuginfo;
@@ -785,12 +796,12 @@ void jl_generate_fptr_for_unspecialized_impl(jl_code_instance_t *unspec)
             jl_gc_wb(unspec, debuginfo);
             _jl_compile_codeinst(unspec, src);
         }
-        jl_callptr_t null = nullptr;
-        // if we hit a codegen bug (or ran into a broken generated function or llvmcall), fall back to the interpreter as a last resort
-        jl_atomic_cmpswap(&unspec->invoke, &null, jl_fptr_interpret_call_addr);
-        JL_GC_POP();
+        JL_UNLOCK(&jitlock); // Might GC
     }
-    JL_UNLOCK(&jl_ExecutionEngine->jitlock); // Might GC
+    JL_GC_POP();
+    jl_callptr_t null = nullptr;
+    // if we hit a codegen bug (or ran into a broken generated function or llvmcall), fall back to the interpreter as a last resort
+    jl_atomic_cmpswap(&unspec->invoke, &null, jl_fptr_interpret_call_addr);
     if (timed) {
         if (measure_compile_time_enabled) {
             auto end = jl_hrtime();
@@ -853,7 +864,7 @@ static auto countBasicBlocks(const Function &F) JL_NOTSAFEPOINT
 static constexpr size_t N_optlevels = 4;
 
 static Expected<orc::ThreadSafeModule> selectOptLevel(orc::ThreadSafeModule TSM, orc::MaterializationResponsibility &R) {
-    TSM.withModuleDo([](Module &M) {
+    TSM.withModuleDo([](Module &M) JL_NOTSAFEPOINT {
         size_t opt_level = std::max(static_cast<int>(jl_options.opt_level), 0);
         do {
             if (jl_generating_output()) {
@@ -1478,20 +1489,24 @@ struct JuliaOJIT::DLSymOptimizer {
 
 #undef INIT_RUNTIME_LIBRARY
     }
+    ~DLSymOptimizer() JL_NOTSAFEPOINT = default;
 
-    void *lookup_symbol(void *libhandle, const char *fname) {
+    void *lookup_symbol(void *libhandle, const char *fname) JL_NOTSAFEPOINT {
         void *addr;
         jl_dlsym(libhandle, fname, &addr, 0);
         return addr;
     }
 
-    void *lookup(const char *libname, const char *fname) {
+    void *lookup(const char *libname, const char *fname) JL_NOTSAFEPOINT_LEAVE JL_NOTSAFEPOINT_ENTER {
         StringRef lib(libname);
         StringRef f(fname);
         std::lock_guard<std::mutex> lock(symbols_mutex);
         auto uit = user_symbols.find(lib);
         if (uit == user_symbols.end()) {
+            jl_task_t *ct = jl_current_task;
+            int8_t gc_state = jl_gc_unsafe_enter(ct->ptls);
             void *handle = jl_get_library_(libname, 0);
+            jl_gc_unsafe_leave(ct->ptls, gc_state);
             if (!handle)
                 return nullptr;
             uit = user_symbols.insert(std::make_pair(lib, std::make_pair(handle, StringMap<void*>()))).first;
@@ -1506,7 +1521,7 @@ struct JuliaOJIT::DLSymOptimizer {
         return handle;
     }
 
-    void *lookup(uintptr_t libidx, const char *fname) {
+    void *lookup(uintptr_t libidx, const char *fname) JL_NOTSAFEPOINT {
         std::lock_guard<std::mutex> lock(symbols_mutex);
         runtime_symbols.resize(std::max(runtime_symbols.size(), libidx + 1));
         auto it = runtime_symbols[libidx].second.find(fname);
@@ -1518,7 +1533,7 @@ struct JuliaOJIT::DLSymOptimizer {
         return handle;
     }
 
-    void operator()(Module &M) {
+    void operator()(Module &M) JL_NOTSAFEPOINT_LEAVE JL_NOTSAFEPOINT_ENTER {
         for (auto &GV : M.globals()) {
             auto Name = GV.getName();
             if (Name.starts_with("jlplt") && Name.ends_with("got")) {
@@ -1634,7 +1649,7 @@ struct JuliaOJIT::DLSymOptimizer {
     bool named;
 };
 
-void optimizeDLSyms(Module &M) {
+void optimizeDLSyms(Module &M) JL_NOTSAFEPOINT_LEAVE JL_NOTSAFEPOINT_ENTER {
     JuliaOJIT::DLSymOptimizer(true)(M);
 }
 
