@@ -24,10 +24,11 @@ using ._TOP_MOD:     # Base definitions
     isempty, ismutabletype, keys, last, length, max, min, missing, pop!, push!, pushfirst!,
     unwrap_unionall, !, !=, !==, &, *, +, -, :, <, <<, =>, >, |, ∈, ∉, ∩, ∪, ≠, ≤, ≥, ⊆
 using Core.Compiler: # Core.Compiler specific definitions
-    Bottom, IRCode, IR_FLAG_NOTHROW, InferenceResult, SimpleInferenceLattice,
+    AbstractLattice, Bottom, IRCode, IR_FLAG_NOTHROW, InferenceResult, SimpleInferenceLattice,
     argextype, fieldcount_noerror, hasintersect, has_flag, intrinsic_nothrow,
-    is_meta_expr_head, isbitstype, isexpr, println, setfield!_nothrow, singleton_type,
-    try_compute_field, try_compute_fieldidx, widenconst, ⊑, AbstractLattice
+    is_meta_expr_head, is_mutation_free_argtype, isbitstype, isexpr, println,
+    setfield!_nothrow, singleton_type, try_compute_field, try_compute_fieldidx, widenconst,
+    ⊑
 
 include(x) = _TOP_MOD.include(@__MODULE__, x)
 if _TOP_MOD === Core.Compiler
@@ -1074,7 +1075,10 @@ function escape_invoke!(astate::AnalysisState, pc::Int, args::Vector{Any})
             # escape its arguments. However, since the arguments might be returned, we need
             # to consider the possibility of aliasing between them and the return value.
             for argidx = first_idx:last_idx
-                add_alias_change!(astate, ret, args[argidx])
+                arg = args[argidx]
+                if !is_mutation_free_argtype(argextype(arg, astate.ir))
+                    add_alias_change!(astate, ret, arg)
+                end
             end
             return nothing
         else
